@@ -1,0 +1,88 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+VM_IP = "192.168.56.10"
+TRIVY_VERSION = "0.74.0"
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.box_url = "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64-vagrant.box"
+  config.vm.box_check_update = false
+  config.vm.hostname = "devsecops-vm"
+
+  config.vm.network "private_network", ip: VM_IP
+  config.vm.network "forwarded_port", guest: 8080, host: 8080, host_ip: "127.0.0.1"
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.name = "devsecops-vm"
+    vb.memory = 2048
+    vb.cpus = 2
+  end
+
+  # Используем rsync: на Windows VirtualBox Shared Folders ломает LF/права.
+  # rsync копирует файлы как есть, права сохраняются.
+  config.vm.synced_folder "..", "/home/vagrant/devsecops-lab",
+    type: "rsync",
+    rsync__exclude: [".git/", ".vagrant/", "app/.venv/", "reports/", "*.pyc", "__pycache__/"],
+    rsync__args: ["--verbose", "--archive", "--delete", "-z"]
+
+  # --- Provisioning ---
+  config.vm.provision "shell", name: "docker-and-registry", inline: <<-SHELL
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y docker.io docker-buildx curl ca-certificates
+
+    # Docker без sudo — только для пользователя vagrant
+    usermod -aG docker vagrant
+
+    # Insecure registry для учебной сети
+    mkdir -p /etc/docker
+    if [ ! -f /etc/docker/daemon.json ] || ! grep -q "insecure-registries" /etc/docker/daemon.json; then
+      echo '{ "insecure-registries": ["#{VM_IP}:5000"] }' > /etc/docker/daemon.json
+    fi
+
+    systemctl enable docker
+    systemctl restart docker
+
+    # Запуск реестра — идемпотентно
+    if ! docker ps -a --format '{{.Names}}' | grep -q '^registry$'; then
+      docker run -d --name registry --restart=always \
+        -p 5000:5000 -v registry-data:/var/lib/registry registry:3
+    else
+      docker start registry || true
+    fi
+
+    # Ждём, пока API реестра поднимется
+    for i in $(seq 1 30); do
+      if curl -sf http://localhost:5000/v2/_catalog >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+
+    docker ps --filter name=registry
+  SHELL
+
+  config.vm.provision "shell", name: "trivy", inline: <<-SHELL
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    TRIVY_VERSION="#{TRIVY_VERSION}"
+    cd /tmp
+
+    # Скачиваем Trivy и контрольные суммы (идемпотентно — просто перезаписываем)
+    curl -sSfLO "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+    curl -sSfLO "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt"
+
+    # Проверка контрольной суммы
+    sha256sum --ignore-missing -c "trivy_${TRIVY_VERSION}_checksums.txt"
+
+    # Установка
+    tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" trivy
+    install -m 0755 trivy /usr/local/bin/trivy
+
+    trivy --version
+  SHELL
+end
